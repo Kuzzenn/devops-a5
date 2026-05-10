@@ -1,0 +1,181 @@
+# .github/workflows/testing-deploy.yml
+ 
+name: 'CI/CD — Deploy to Testing'
+ 
+on:
+  pull_request:
+    branches: [ main ]     # Only PRs targeting main trigger this
+  workflow_dispatch:       # Adds 'Run workflow' button in GitHub UI 
+ 
+jobs:
+  build-test-lint-deploy:
+    name: 'Build → Test → Lint → Deploy → Notify'
+    runs-on: ubuntu-latest   # Free Ubuntu VM provided by GitHub
+    # This entire job fails fast — if Build fails, Test never runs, etc.
+ 
+    steps:
+ 
+      # ── Step 1: CHECKOUT 
+      - name: 'Checkout Repository'
+        uses: actions/checkout@v4
+       
+ 
+      # ── Step 2: SETUP NODE 
+      # Installs Node.js on the runner
+      # cache: 'npm' caches node_modules between runs (faster pipeline)
+      - name: 'Setup Node.js 20'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+        
+ 
+      # ── Step 3: INSTALL DEPENDENCIES 
+      - name: 'Install Backend Dependencies'
+        working-directory: ./backend
+        run: npm ci
+        
+      # ── Step 4: BUILD 
+      
+      - name: ' Build — Verify Code Loads Without Errors'
+        working-directory: ./backend
+        run: node -e "require('./server'); process.exit(0);"
+          
+        env:
+          NODE_ENV: test   # Prevents MongoDB connection attempt
+ 
+      # ── Step 5: UNIT TEST
+      # Runs Jest — all files matching *.test.js
+      - name: 'Run Unit Tests (Jest)'
+        working-directory: ./backend
+        run: npm test
+        env:
+          NODE_ENV: test
+       
+ 
+      # ── Step 6: LINT 
+      - name: 'Code Analysis — ESLint'
+        working-directory: ./backend
+        run: npm run lint
+        
+ 
+      # ── Step 7: BUILD FRONTEND 
+      - name: 'Install Frontend Dependencies'
+        working-directory: ./frontend
+        run: npm ci
+ 
+      - name: 'Build Frontend (React)'
+        working-directory: ./frontend
+        run: npm run build
+        env:
+          CI: false         # Prevents React warnings from failing the build
+          REACT_APP_API_URL: http://${{ secrets.TESTING_SERVER_IP }}:5000
+ 
+      # ── Step 8: DEPLOY 
+      # Uses the appleboy/ssh-action to SSH into EC2 and run commands
+      
+      - name: 'Deploy to AWS Testing Server'
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host:     ${{ secrets.TESTING_SERVER_IP }}
+          username: ubuntu    # Default username for Ubuntu AMIs on EC2
+          key:      ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e   # Exit immediately if any command fails
+            
+            export NVM_DIR="$HOME/.nvm"
+            source "$NVM_DIR/nvm.sh"
+            nvm use --lts
+ 
+            # Clone repo if first time, otherwise pull latest changes
+            if [ ! -d ~/app ]; then
+              git clone https://github.com/${{ github.repository }}.git ~/app
+            fi
+            cd ~/app
+            git fetch origin
+            git checkout ${{ github.head_ref || github.ref_name }}
+            git pull
+ 
+            # Install and start backend
+            cd ~/app/backend
+            npm ci --omit=dev
+            pm2 delete backend 2>/dev/null || true
+            PORT=5000 pm2 start server.js --name backend
+ 
+            # Build and serve frontend
+            cd ~/app/frontend
+            npm ci
+            REACT_APP_API_URL=http://${{ secrets.TESTING_SERVER_IP }}:5000 npm run build
+            pm2 delete frontend 2>/dev/null || true
+            pm2 serve build 3000 --name frontend --spa
+ 
+            pm2 save   # Persist process list across reboots
+            pm2 list   # Print status so it appears in logs
+ 
+      # ── Step 9: NOTIFY QA on SUCCESS 
+      # if: success() means this step only runs if ALL previous steps passed
+      - name: 'Notify QA — Deployment Successful'
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address:  smtp.gmail.com
+          server_port:     587
+          secure:          false
+          username:        ${{ secrets.EMAIL_USER }}
+          password:        ${{ secrets.EMAIL_PASS }}
+          to:              ${{ secrets.QA_EMAIL }}
+          from:            'DevOps Pipeline <${{ secrets.EMAIL_USER }}>'
+          subject:         '[Testing] New Feature Ready — PR #${{ github.event.pull_request.number }}'
+          body: |
+            Dear QA Team,
+ 
+            A new feature has been successfully deployed to the Testing environment
+            and is ready for your review.
+ 
+            ── Pull Request Details ──────────────────
+            Title:   ${{ github.event.pull_request.title }}
+            Author:  ${{ github.actor }}
+            Branch:  ${{ github.head_ref }}
+            PR Link: ${{ github.event.pull_request.html_url }}
+ 
+            ── Access the Deployed Application ──────
+            Frontend:    http://${{ secrets.TESTING_SERVER_IP }}:3000
+            Backend API: http://${{ secrets.TESTING_SERVER_IP }}:5000
+            Health Check: http://${{ secrets.TESTING_SERVER_IP }}:5000/health
+ 
+            All automated checks (build, unit tests, linting) passed.
+ 
+            Regards,
+            Automated CI/CD Pipeline — DevOps CS316
+ 
+      # ── Step 10: NOTIFY on FAILURE 
+      # if: failure() means this step only runs if something above FAILED
+      - name: 'Notify — Pipeline Failed'
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address:  smtp.gmail.com
+          server_port:     587
+          secure:          false
+          username:        ${{ secrets.EMAIL_USER }}
+          password:        ${{ secrets.EMAIL_PASS }}
+          to:              '${{ secrets.INSTRUCTOR_EMAIL }}, ${{ secrets.DEVELOPER_EMAIL }}'
+          from:            'DevOps Pipeline <${{ secrets.EMAIL_USER }}>'
+          subject:         '[Pipeline FAILED] PR #${{ github.event.pull_request.number }} — ${{ github.actor }}'
+          body: |
+            The CI/CD pipeline has FAILED and the changes were NOT deployed.
+ 
+            ── Failure Details ──────────────────────
+            PR Title:  ${{ github.event.pull_request.title }}
+            Author:    ${{ github.actor }}
+            Branch:    ${{ github.head_ref }}
+ 
+            ── View Full Error Log ───────────────────
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+ 
+            Please fix the errors and push again.
+ 
+            Regards,
+            Automated CI/CD Pipeline — DevOps CS316
+

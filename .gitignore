@@ -1,0 +1,13 @@
+# Node modules — never commit these (huge, reproducible with npm install)
+node_modules/
+ 
+# Build output — generated files, not source
+frontend/build/
+ 
+# Environment files — contain secrets/passwords
+.env
+.env.local
+ 
+# OS files
+.DS_Store
+*.log

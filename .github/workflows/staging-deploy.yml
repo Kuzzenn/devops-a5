@@ -1,0 +1,138 @@
+# .github/workflows/staging-deploy.yml
+
+name: 'CI/CD — Deploy to Staging'
+ 
+on:
+  push:
+    branches: [ main ]     # Any push/merge to main triggers this
+  workflow_dispatch:       # Manual trigger button
+ 
+jobs:
+  build-test-lint-deploy-staging:
+    name: 'Build → Test → Lint → Deploy Staging → Notify'
+    runs-on: ubuntu-latest
+ 
+    steps:
+ 
+      - name: 'Checkout Repository'
+        uses: actions/checkout@v4
+ 
+      - name: 'Setup Node.js 20'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+ 
+      - name: 'Install Backend Dependencies'
+        working-directory: ./backend
+        run: npm ci
+ 
+      - name: 'Build — Verify Backend Loads'
+        working-directory: ./backend
+        run: node -e "require('./server'); process.exit(0);"
+        env:
+          NODE_ENV: test
+ 
+      - name: 'Run Unit Tests (Jest)'
+        working-directory: ./backend
+        run: npm test
+        env:
+          NODE_ENV: test
+ 
+      - name: 'Code Analysis — ESLint'
+        working-directory: ./backend
+        run: npm run lint
+ 
+      - name: 'Install Frontend Dependencies'
+        working-directory: ./frontend
+        run: npm ci
+ 
+      - name: 'Build Frontend (React)'
+        working-directory: ./frontend
+        run: npm run build
+        env:
+          CI: false
+          REACT_APP_API_URL: http://${{ secrets.STAGING_SERVER_IP }}:5000
+ 
+      - name: 'Deploy to AWS Staging Server'
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host:     ${{ secrets.STAGING_SERVER_IP }}
+          username: ubuntu
+          key:      ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+            export NVM_DIR="$HOME/.nvm"
+            source "$NVM_DIR/nvm.sh"
+            nvm use --lts
+            
+            if [ ! -d ~/app ]; then
+              git clone https://github.com/${{ github.repository }}.git ~/app
+            fi
+            cd ~/app
+            git fetch origin
+            git checkout main
+            git pull origin main
+ 
+            cd ~/app/backend
+            npm ci --omit=dev
+            pm2 delete backend 2>/dev/null || true
+            PORT=5000 pm2 start server.js --name backend
+ 
+            cd ~/app/frontend
+            npm ci
+            REACT_APP_API_URL=http://${{ secrets.STAGING_SERVER_IP }}:5000 npm run build
+            pm2 delete frontend 2>/dev/null || true
+            pm2 serve build 3000 --name frontend --spa
+ 
+            pm2 save
+            pm2 list
+ 
+      - name: 'Notify Team — Staging Updated'
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address:  smtp.gmail.com
+          server_port:     587
+          secure:          false
+          username:        ${{ secrets.EMAIL_USER }}
+          password:        ${{ secrets.EMAIL_PASS }}
+          to:              ${{ secrets.QA_EMAIL }}
+          from:            'DevOps Pipeline <${{ secrets.EMAIL_USER }}>'
+          subject:         '[Staging] Deployment Successful — ${{ github.sha }}'
+          body: |
+            Staging environment has been updated and is ready for review.
+ 
+            ── Deployment Details ────────────────────
+            Commit:  ${{ github.sha }}
+            Author:  ${{ github.actor }}
+            Message: ${{ github.event.head_commit.message }}
+            Branch:  main
+ 
+            ── Access the Staging Application ────────
+            Frontend:    http://${{ secrets.STAGING_SERVER_IP }}:3000
+            Backend API: http://${{ secrets.STAGING_SERVER_IP }}:5000
+            Health Check: http://${{ secrets.STAGING_SERVER_IP }}:5000/health
+ 
+            Regards,
+            Automated CI/CD Pipeline — DevOps CS316
+ 
+      - name: 'Notify — Staging Deployment Failed'
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address:  smtp.gmail.com
+          server_port:     587
+          secure:          false
+          username:        ${{ secrets.EMAIL_USER }}
+          password:        ${{ secrets.EMAIL_PASS }}
+          to:              '${{ secrets.INSTRUCTOR_EMAIL }}, ${{ secrets.DEVELOPER_EMAIL }}'
+          from:            'DevOps Pipeline <${{ secrets.EMAIL_USER }}>'
+          subject:         '[Staging FAILED] Commit ${{ github.sha }}'
+          body: |
+            Staging deployment failed.
+            Commit: ${{ github.sha }}
+            Author: ${{ github.actor }}
+            Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
