@@ -1,0 +1,67 @@
+# docker-compose.yml
+# Run with: docker compose up --build
+ 
+services:
+ 
+  mongodb:
+    image: mongo:7.0    
+    container_name: mongodb
+    restart: always      
+    ports:
+      - '27017:27017'    
+                         
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - app-network      
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+ 
+  
+  backend:
+    build:
+      context: ./backend   # Path to directory containing Dockerfile
+      dockerfile: Dockerfile
+    container_name: backend
+    restart: always
+    ports:
+      - '5000:5000'
+    environment:
+      - NODE_ENV=production
+      - MONGO_URI=mongodb://mongodb:27017/students
+      - PORT=5000
+    depends_on:
+      mongodb:
+        condition: service_healthy   # Wait for MongoDB to be ready
+    networks:
+      - app-network
+ 
+ 
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        REACT_APP_API_URL: http://localhost:5000
+    container_name: frontend
+    restart: always
+    ports:
+      - '80:80'           # nginx serves on port 80 
+    depends_on:
+      - backend
+    networks:
+      - app-network
+ 
+
+volumes:
+  mongo_data:               # Stored at /var/lib/docker/volumes/
+ 
+
+networks:
+  app-network:
+         
+
+

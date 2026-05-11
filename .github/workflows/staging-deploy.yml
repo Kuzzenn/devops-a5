@@ -1,15 +1,13 @@
-# .github/workflows/staging-deploy.yml
-
-name: 'CI/CD — Deploy to Staging'
+name: 'Docker CI/CD — Deploy to Staging'
  
 on:
   push:
-    branches: [ main ]     # Any push/merge to main triggers this
-  workflow_dispatch:       # Manual trigger button
+    branches: [ main ]
+  workflow_dispatch:
  
 jobs:
-  build-test-lint-deploy-staging:
-    name: 'Build → Test → Lint → Deploy Staging → Notify'
+  docker-ci-cd-staging:
+    name: 'Build > Test > Lint > Docker Push > Staging Deploy > Notify'
     runs-on: ubuntu-latest
  
     steps:
@@ -24,17 +22,15 @@ jobs:
           cache: 'npm'
           cache-dependency-path: backend/package-lock.json
  
-      - name: 'Install Backend Dependencies'
+      - name: 'Build — Install & Verify Backend'
         working-directory: ./backend
-        run: npm ci
- 
-      - name: 'Build — Verify Backend Loads'
-        working-directory: ./backend
-        run: node -e "require('./server'); process.exit(0);"
+        run: |
+          npm ci
+          node -e "require('./server'); process.exit(0);"
         env:
           NODE_ENV: test
  
-      - name: 'Run Unit Tests (Jest)'
+      - name: 'Unit Tests (Jest)'
         working-directory: ./backend
         run: npm test
         env:
@@ -44,18 +40,37 @@ jobs:
         working-directory: ./backend
         run: npm run lint
  
-      - name: 'Install Frontend Dependencies'
-        working-directory: ./frontend
-        run: npm ci
+      - name: 'Configure AWS Credentials'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
  
-      - name: 'Build Frontend (React)'
-        working-directory: ./frontend
-        run: npm run build
-        env:
-          CI: false
-          REACT_APP_API_URL: http://${{ secrets.STAGING_SERVER_IP }}:5000
+      - name: 'Login to Amazon ECR'
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
  
-      - name: 'Deploy to AWS Staging Server'
+      - name: 'Build & Push Backend Image'
+        run: |
+          IMAGE_URI=${{ secrets.ECR_REGISTRY }}/${{ secrets.ECR_REPOSITORY }}
+          docker build -t ${IMAGE_URI}:backend-${{ github.sha }} \
+                       -t ${IMAGE_URI}:backend-latest ./backend
+          docker push ${IMAGE_URI}:backend-${{ github.sha }}
+          docker push ${IMAGE_URI}:backend-latest
+ 
+      - name: 'Build & Push Frontend Image'
+        run: |
+          IMAGE_URI=${{ secrets.ECR_REGISTRY }}/${{ secrets.ECR_REPOSITORY }}
+          docker build \
+            --build-arg REACT_APP_API_URL=http://${{ secrets.STAGING_SERVER_IP }}:5000 \
+            -t ${IMAGE_URI}:frontend-${{ github.sha }} \
+            -t ${IMAGE_URI}:frontend-latest \
+            ./frontend
+          docker push ${IMAGE_URI}:frontend-${{ github.sha }}
+          docker push ${IMAGE_URI}:frontend-latest
+ 
+      - name: 'Deploy to AWS Staging Server (Docker)'
         uses: appleboy/ssh-action@v1.0.0
         with:
           host:     ${{ secrets.STAGING_SERVER_IP }}
@@ -63,76 +78,68 @@ jobs:
           key:      ${{ secrets.EC2_SSH_KEY }}
           script: |
             set -e
-            export NVM_DIR="$HOME/.nvm"
-            source "$NVM_DIR/nvm.sh"
-            nvm use --lts
-            
+ 
+            aws ecr get-login-password --region ${{ secrets.AWS_REGION }} \
+              | docker login --username AWS \
+              --password-stdin ${{ secrets.ECR_REGISTRY }}
+ 
+            BACKEND_IMAGE=${{ secrets.ECR_REGISTRY }}/${{ secrets.ECR_REPOSITORY }}:backend-latest
+            FRONTEND_IMAGE=${{ secrets.ECR_REGISTRY }}/${{ secrets.ECR_REPOSITORY }}:frontend-latest
+ 
+            docker pull $BACKEND_IMAGE
+            docker pull $FRONTEND_IMAGE
+ 
             if [ ! -d ~/app ]; then
               git clone https://github.com/${{ github.repository }}.git ~/app
             fi
-            cd ~/app
-            git fetch origin
-            git checkout main
-            git pull origin main
+            cd ~/app && git fetch origin && git checkout main && git pull
  
-            cd ~/app/backend
-            npm ci --omit=dev
-            pm2 delete backend 2>/dev/null || true
-            PORT=5000 pm2 start server.js --name backend
+            export BACKEND_IMAGE=$BACKEND_IMAGE
+            export FRONTEND_IMAGE=$FRONTEND_IMAGE
+            docker compose -f docker-compose.prod.yml down
+            docker compose -f docker-compose.prod.yml up -d
+            docker compose -f docker-compose.prod.yml ps
  
-            cd ~/app/frontend
-            npm ci
-            REACT_APP_API_URL=http://${{ secrets.STAGING_SERVER_IP }}:5000 npm run build
-            pm2 delete frontend 2>/dev/null || true
-            pm2 serve build 3000 --name frontend --spa
- 
-            pm2 save
-            pm2 list
+            sleep 5
+            curl -sf http://localhost:5000/health && echo 'Backend healthy'
  
       - name: 'Notify Team — Staging Updated'
         if: success()
         uses: dawidd6/action-send-mail@v3
         with:
-          server_address:  smtp.gmail.com
-          server_port:     587
-          secure:          false
-          username:        ${{ secrets.EMAIL_USER }}
-          password:        ${{ secrets.EMAIL_PASS }}
-          to:              ${{ secrets.QA_EMAIL }}
-          from:            'DevOps Pipeline <${{ secrets.EMAIL_USER }}>'
-          subject:         '[Staging] Deployment Successful — ${{ github.sha }}'
+          server_address: smtp.gmail.com
+          server_port:    587
+          secure:         false
+          username:       ${{ secrets.EMAIL_USER }}
+          password:       ${{ secrets.EMAIL_PASS }}
+          to:             ${{ secrets.QA_EMAIL }}
+          from:           'DevOps Pipeline <${{ secrets.EMAIL_USER }}>'
+          subject:        '[Staging/Docker] Updated — ${{ github.sha }}'
           body: |
-            Staging environment has been updated and is ready for review.
+            Staging has been updated with Dockerized application.
  
-            ── Deployment Details ────────────────────
-            Commit:  ${{ github.sha }}
-            Author:  ${{ github.actor }}
-            Message: ${{ github.event.head_commit.message }}
-            Branch:  main
+            Commit:   ${{ github.sha }}
+            Author:   ${{ github.actor }}
+            Message:  ${{ github.event.head_commit.message }}
  
-            ── Access the Staging Application ────────
-            Frontend:    http://${{ secrets.STAGING_SERVER_IP }}:3000
+            Frontend:    http://${{ secrets.STAGING_SERVER_IP }}
             Backend API: http://${{ secrets.STAGING_SERVER_IP }}:5000
-            Health Check: http://${{ secrets.STAGING_SERVER_IP }}:5000/health
  
-            Regards,
-            Automated CI/CD Pipeline — DevOps CS316
+            DevOps Pipeline — DevOps CS316
  
-      - name: 'Notify — Staging Deployment Failed'
+      - name: 'Notify — Staging Failed'
         if: failure()
         uses: dawidd6/action-send-mail@v3
         with:
-          server_address:  smtp.gmail.com
-          server_port:     587
-          secure:          false
-          username:        ${{ secrets.EMAIL_USER }}
-          password:        ${{ secrets.EMAIL_PASS }}
-          to:              '${{ secrets.INSTRUCTOR_EMAIL }}, ${{ secrets.DEVELOPER_EMAIL }}'
-          from:            'DevOps Pipeline <${{ secrets.EMAIL_USER }}>'
-          subject:         '[Staging FAILED] Commit ${{ github.sha }}'
+          server_address: smtp.gmail.com
+          server_port:    587
+          secure:         false
+          username:       ${{ secrets.EMAIL_USER }}
+          password:       ${{ secrets.EMAIL_PASS }}
+          to:             '${{ secrets.INSTRUCTOR_EMAIL }}, ${{ secrets.DEVELOPER_EMAIL }}'
+          from:           'DevOps Pipeline <${{ secrets.EMAIL_USER }}>'
+          subject:        '[Staging/Docker FAILED] ${{ github.sha }}'
           body: |
-            Staging deployment failed.
-            Commit: ${{ github.sha }}
-            Author: ${{ github.actor }}
+            Staging Docker deployment failed.
             Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
